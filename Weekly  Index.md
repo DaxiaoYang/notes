@@ -1,6 +1,8 @@
-# Weekly Todo
+# Weekly 
 
-## 2021.5.10-5.16
+## 2021
+
+### 5.10-5.16
 
 - [x] Leetcode 7
 
@@ -111,7 +113,7 @@
 
 
 
-## 2021.5.17-5.23
+### 5.17-5.23
 
 + [x] leetcode7+
 
@@ -129,19 +131,126 @@
 
 + [ ] `simple dateformat` 线程安全问题 看下源码
 
-+ [ ] uml图
++ [x] uml图
 
 + [ ] 线程被中断后执行
 
 + [ ] https://redis.io/topics/persistence
 
-+ [ ] 字符串匹配算法
++ [x] 字符串匹配算法
 
 + [x] 看下模板和策略模式
 
-+ [ ] 看下lambda那块的内容
++ [x] 看下lambda那块的内容
 
-+ [ ] `protocol buffer`
++ [x] `protocol buffer`
 
-+ [ ] `? extends ? super`复习一下这个
++ [x] `? extends ? super`复习一下这个
+
+
+
+### 5.24-5.30
+
+- [ ] Leetcode 7
+
+- [ ] design pattern 20
+
+- [ ] 计组 7
+
+- [ ] `event bus`源码
+
+- [x] `lambda`表达式实现：内部类 是一个语法糖
+
+- [x] *little endian* 字节序
+
+  `0x01234567`
+
+  ![](http://4.bp.blogspot.com/_IEmaCFe3y9g/SO3GGEF4UkI/AAAAAAAAAAc/z7waF2Lwg0s/s400/lb.GIF)
+
+- [ ] 为什么栈是从高位向地位扩展的
+
+- [ ] [`disruptor`](https://lmax-exchange.github.io/disruptor/disruptor.html)
+
+- [x] `FileChannel.map -> MappedByteBuffer `  
+
+  可以加载文件的部分到内存中
+
+  ```java
+  public void givenFile_whenReadAFileSectionIntoMemoryWithFileChannel_thenCorrect() 
+    throws IOException { 
+      try (RandomAccessFile reader = new RandomAccessFile("src/test/resources/test_read.in", "r");
+          FileChannel channel = reader.getChannel();
+          ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+  
+          MappedByteBuffer buff = channel.map(FileChannel.MapMode.READ_ONLY, 6, 5);
+  
+          if(buff.hasRemaining()) {
+            byte[] data = new byte[buff.remaining()];
+            buff.get(data);
+            assertEquals("world", new String(data, StandardCharsets.UTF_8));	
+          }
+      }
+  }
+  ```
+
+  [FileChannel](https://www.baeldung.com/java-filechannel)
+
+  
+
+
+### 6.7-6.13
+
+Todo List
+
+- [ ] Leetcode 7
+
+- [ ] 计组 7
+
+- [ ] Tomcat & Jetty 14
+
+  
+
+Problem Set:
+
+- `spring`单例的范围是IOC容器
+
+-  `memory swapping`
+
+-  再看一下算法专栏hash的用途
+
+- **布隆过滤器: java: BitSet Guava bloomFilter**
+
+-  `gitub`的使用
+
+-  再梳理一下函数调用的过程 汇编
+
+- [`java.nio`](http://tutorials.jenkov.com/java-nio/index.html)
+
+  > The meaing of non-blocking IO:
+  >
+  > Java IO's various streams are blocking. That means, that when a thread invokes a `read()` or `write()`, that thread is blocked until there is some data to read, or the data is fully written. The thread can do nothing else in the meantime.
+  >
+  > Java NIO's non-blocking mode enables a thread to request reading data from a channel, and only get what is currently available, or nothing at all, if no data is currently available. Rather than remain blocked until data becomes available for reading, the thread can go on with something else.
+  >
+  > The same is true for non-blocking writing. A thread can request that some data be written to a channel, but not wait for it to be fully written. The thread can then go on and do something else in the mean time.
+  >
+  > What threads spend their idle time on when not blocked in IO calls, is usually performing IO on other channels in the meantime. That is, a single thread can now manage multiple channels of input and output.
+
+-  [tomcat热部署](https://blog.csdn.net/joeyon1985/article/details/46722655)
+
+- ==shell脚本编程==
+
+- ==clickhouse==
+
+-  servlet规范
+
+-  [UML类图](https://zhuanlan.zhihu.com/p/109655171)
+
+- [ ] [Java nio server](https://github.com/jjenkov/java-nio-server)
+
+- [ ] [WebSocket](https://www.tutorialspoint.com/websockets/index.htm)
+
+
+
+
 
