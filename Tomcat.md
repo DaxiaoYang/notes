@@ -747,6 +747,8 @@ Servlet规范中需要有的组件
 
 
 
+官方文档 -> 使用 -> 带着问题去研究源码
+
 
 
 ## 连接器
@@ -1756,4 +1758,2070 @@ Tomcat先判断有没有ws的请求头，如果有就进行协议升级：
 - 创建websocket Session实例和endpoint实例与当前websocket连接一一对应，此websocket连接不会立即关闭
 
 
+
+### Jetty的EatWhatYouKill线程策略
+
+
+
+**Selector编程一般思路**
+
+- 启动一个线程在一个死循环里面不断调用select方法 监测channel的IO状态（生产者）
+- 一旦IO事件发生 就把该事件和相关数据封装成一个Runnable
+- 把Runnable放到新的线程中去执行（消费者）
+
+
+
+**一般思路的缺点**
+
+- 无法利用CPU缓存（切换线程时 可能会用另外一个CPU核 这样原来的缓存的数据就用不上了）
+- 线程切换也会有开销
+
+
+
+Jetty中的Connector：把IO事件的生产和消费放到同一个线程中处理，方便利用CPU缓存
+
+
+
+**ManagedSelector**
+
+```java
+
+public class ManagedSelector extends ContainerLifeCycle implements Dumpable
+{
+    //原子变量，表明当前的ManagedSelector是否已经启动
+    private final AtomicBoolean _started = new AtomicBoolean(false);
+    
+    //表明是否阻塞在select调用上
+    private boolean _selecting = false;
+    
+    //管理器的引用，SelectorManager管理若干ManagedSelector的生命周期
+    private final SelectorManager _selectorManager;
+    
+    //ManagedSelector不止一个，为它们每人分配一个id
+    private final int _id;
+    
+    //关键的执行策略，生产者和消费者是否在同一个线程处理由它决定
+    private final ExecutionStrategy _strategy;
+    
+    //Java原生的Selector
+    private Selector _selector;
+    
+    //"Selector更新任务"队列
+    private Deque<SelectorUpdate> _updates = new ArrayDeque<>();
+    private Deque<SelectorUpdate> _updateable = new ArrayDeque<>();
+    
+    ...
+}
+```
+
+
+
+**SelectUpdate接口**
+
+```java
+/**
+ * A selector update to be done when the selector has been woken.
+ */
+public interface SelectorUpdate
+{
+    void update(Selector selector);
+}
+```
+
+用于封装对selector的操作:
+
+- 往selector上注册IO事件
+- 绑定channel到selector上
+
+
+
+**Selectable接口**
+
+```java
+
+public interface Selectable
+{
+    //当某一个Channel的I/O事件就绪后，ManagedSelector会调用的回调函数
+    Runnable onSelected();
+
+    //当所有事件处理完了之后ManagedSelector会调的回调函数，我们先忽略。
+    void updateKey();
+}
+```
+
+endpoint组件向managedSelector注册IO事件时，同时传入一个事件对应的附件类（实现Selectable接口），当事件到达的时候，通过`onSelected()`方法拿到一个回调方法并执行
+
+
+
+**ExecutionStrategy**
+
+```java
+
+public interface ExecutionStrategy
+{
+    //只在HTTP2中用到，简单起见，我们先忽略这个方法。
+    public void dispatch();
+
+    //实现具体执行策略，任务生产出来后可能由当前线程执行，也可能由新线程来执行
+    public void produce();
+    
+    //任务的生产委托给Producer内部接口，
+    public interface Producer
+    {
+        //生产一个Runnable(任务)
+        Runnable produce();
+    }
+}
+```
+
+
+
+实现类：
+
+- `ProduceConsume`
+
+  在一个线程内依次生产和消费IO事件
+
+- `ProduceExecuteConsume`
+
+  任务生产者开启新线程来运行任务(生产者单独一个线程 消费者很多线程)
+
+- `ExecuteProduceConsume`
+
+  任务的生产和消费都在一个线程内，但是可能会新建一个线程以继续生产和消费
+
+  可以利用CPU缓存 但是如果消费IO事件的业务代码执行时间过长 会导致线程大量阻塞
+
+  (多个线程对应多组 生产者-消费者)
+
+- `EatWhatYouKill`
+
+  线程充足时 生产和消费在同一个线程内
+
+  线程不够时 生产一个线程 消费多个线程
+
+
+
+ExecutionStrategy中通过Producer拿到IO事件对应的Runnable对象
+
+然后根据线程策略来做出下一步：
+
+- 自己执行
+- 交给线程池执行
+
+
+
+```java
+
+private class SelectorProducer implements ExecutionStrategy.Producer
+{
+    private Set<SelectionKey> _keys = Collections.emptySet();
+    private Iterator<SelectionKey> _cursor = Collections.emptyIterator();
+
+    @Override
+    public Runnable produce()
+    {
+        while (true)
+        {
+            //如何Channel集合中有I/O事件就绪，调用前面提到的Selectable接口获取Runnable,直接返回给ExecutionStrategy去处理
+            Runnable task = processSelected();
+            if (task != null)
+                return task;
+            
+           //如果没有I/O事件就绪，就干点杂活，看看有没有客户提交了更新Selector的任务，就是上面提到的SelectorUpdate任务类。
+            processUpdates();
+            updateKeys();
+
+           //继续执行select方法，侦测I/O就绪事件
+            if (!select())
+                return null;
+        }
+    }
+ }
+```
+
+
+
+### Tomcat和Jetty中的对象池技术
+
+**使用目的**；
+
+- 为了避免**过大、过复杂**的对象的频繁的**创建、初始化、GC**（会耗费CPU和内存资源）
+- 对象数量多 且存在时间比较短
+
+
+
+**实现方法**：
+
+把一个Java对象用完之后将他保存起来，需要再用时再拿出来（清空之前的信息）重复使用（空间换时间）
+
+
+
+**Tomcat中的对象池**
+
+用了一个同步的栈，需要对象时从栈中去，然后reset对象，清空对象信息
+
+对象使用完毕后将对象压入栈中
+
+```java
+
+public class SynchronizedStack<T> {
+
+    //内部维护一个对象数组,用数组实现栈的功能
+    private Object[] stack;
+
+    // 在使用完之后 这个方法用来归还对象，用synchronized进行线程同步
+    public synchronized boolean push(T obj) {
+        index++;
+        if (index == size) {
+            if (limit == -1 || size < limit) {
+                expand();//对象不够用了，扩展对象数组
+            } else {
+                index--;
+                return false;
+            }
+        }
+        stack[index] = obj;
+        return true;
+    }
+    
+    //这个方法用来获取对象
+    public synchronized T pop() {
+        if (index == -1) {
+            return null;
+        }
+        T result = (T) stack[index];
+        stack[index--] = null;
+        return result;
+    }
+    
+    //扩展对象数组长度，以2倍大小扩展
+    private void expand() {
+      int newSize = size * 2;
+      if (limit != -1 && newSize > limit) {
+          newSize = limit;
+      }
+      //扩展策略是创建一个数组长度为原来两倍的新数组
+      Object[] newStack = new Object[newSize];
+      //将老数组对象引用复制到新数组
+      System.arraycopy(stack, 0, newStack, 0, size);
+      //将stack指向新数组，老数组可以被GC掉了
+      stack = newStack;
+      size = newSize;
+   }
+}
+```
+
+
+
+**Jetty的ByteBufferPool**
+
+```java
+
+public interface ByteBufferPool
+{
+  	// 获取内存 direct表示是否是从本地内存分配
+    public ByteBuffer acquire(int size, boolean direct);
+		// 释放内存（表示内存对象可以被再次复用了）
+    public void release(ByteBuffer buffer);
+}
+```
+
+
+
+```java
+
+public class ArrayByteBufferPool implements ByteBufferPool
+{
+    private final int _min;//最小size的Buffer长度
+    private final int _maxQueue;//Queue最大长度
+    
+    //用不同的Bucket(桶)来持有不同size的ByteBuffer对象,同一个桶中的ByteBuffer size是一样的 数组 + 链表（链表中的结点是大小相同的内存块）
+    private final ByteBufferPool.Bucket[] _direct;
+    private final ByteBufferPool.Bucket[] _indirect;
+    
+    //ByteBuffer的size增量
+    private final int _inc;
+    
+    public ArrayByteBufferPool(int minSize, int increment, int maxSize, int maxQueue)
+    {
+        //检查参数值并设置默认值
+        if (minSize<=0)//ByteBuffer的最小长度
+            minSize=0;
+        if (increment<=0)
+            increment=1024;//默认以1024递增
+        if (maxSize<=0)
+            maxSize=64*1024;//ByteBuffer的最大长度默认是64K
+        
+        //ByteBuffer的最小长度必须小于增量
+        if (minSize>=increment) 
+            throw new IllegalArgumentException("minSize >= increment");
+            
+        //最大长度必须是增量的整数倍
+        if ((maxSize%increment)!=0 || increment>=maxSize)
+            throw new IllegalArgumentException("increment must be a divisor of maxSize");
+         
+        _min=minSize;
+        _inc=increment;
+        
+        //创建maxSize/increment个桶,包含直接内存的与heap的
+        _direct=new ByteBufferPool.Bucket[maxSize/increment];
+        _indirect=new ByteBufferPool.Bucket[maxSize/increment];
+        _maxQueue=maxQueue;
+        int size=0;
+      	// 1024 2048 ... 64K
+        for (int i=0;i<_direct.length;i++)
+        {
+          size+=_inc;
+          _direct[i]=new ByteBufferPool.Bucket(this,size,_maxQueue);
+          _indirect[i]=new ByteBufferPool.Bucket(this,size,_maxQueue);
+        }
+    }
+}
+```
+
+
+
+```java
+// bucket内部维护了一个链表来存放bytebuffer对象的引用
+private final Deque<ByteBuffer> _queue = new ConcurrentLinkedDeque<>();
+```
+
+![](https://static001.geekbang.org/resource/image/85/79/852834815eda15e82888ec18a81b5879.png)
+
+
+
+buffer的分配和释放就是堆bucket中的deque作出队和入队操作
+
+```java
+
+//分配Buffer
+public ByteBuffer acquire(int size, boolean direct)
+{
+    //找到对应的桶，没有的话创建一个桶
+    ByteBufferPool.Bucket bucket = bucketFor(size,direct);
+    if (bucket==null)
+        return newByteBuffer(size,direct);
+    //这里其实调用了Deque的poll方法
+    return bucket.acquire(direct);
+        
+}
+
+//释放Buffer
+public void release(ByteBuffer buffer)
+{
+    if (buffer!=null)
+    {
+      //找到对应的桶
+      ByteBufferPool.Bucket bucket = bucketFor(buffer.capacity(),buffer.isDirect());
+      
+      //这里调用了Deque的offerFirst方法
+  if (bucket!=null)
+      bucket.release(buffer);
+    }
+}
+```
+
+
+
+### Tomcat Jetty的高性能 高并发之道
+
+**高性能**：
+
+- 高效地利用CPU 内存 磁盘 网络等资源
+
+  如何实现：
+
+  - **减少资源浪费**：避免线程阻塞造成上下文切换 过多的数据拷贝
+  - 空间换时间（缓存或者对象池） 或者时间换空间（数据压缩后再进行网络传输）
+
+- 在短时间内处理大量请求
+
+  - 短时间：响应时间
+  - 大量请求：TPS 每秒处理的事务数
+
+
+
+**IO和线程模型**
+
+IO模型:
+
+- 本质作用：解决CPU与外设之间的速度差
+- 目标：尽量减少业务线程因为等待IO而造成的阻塞
+- 采用的方法：非阻塞IO 异步IO
+
+
+
+线程模型：
+
+- 连接请求由专门的Acceptor线程组来处理
+- IO事件探测由专门的Selector线程组来处理
+- 具体的协议解析和业务处理可能交给线程池（另外的线程），或者Selector线程自己处理（同一个线程中 可以利用CPU缓存 减少线程的上下文切换）
+
+> CPU的核数有限 线程过多反而会造成过多的线程上下文切换
+
+
+
+**减少系统调用**
+
+系统调用涉及到用户态到内核态的切换 比较消耗系统资源
+
+- 批处理：用缓冲存储数据 达到一定规模后才进行处理
+- 延迟处理或者避免处理：等到真正需要进行操作时才进行系统调用 不需要相关操作就不进行系统调用
+
+
+
+**池化 零拷贝**
+
+池化：
+
+- 使用场景：当使用的对象很大 很复杂 且需要创建的数量多 生命周期短时 
+- 需要注意的点：
+  - 对象用完后 归还给对象池
+  - 对象池中的对象取出时需要进行重置 否则会有脏数据
+  - 对象池需要加锁或者用并发容器保证线程安全
+  - 向对象池请求对象时可能出现阻塞 异常 或者null值 都需要在使用时进行额外的处理
+
+
+
+**高效的并发编程**
+
+
+
+**缩小锁的范围**
+
+```java
+// 不在方法上加锁而是在内部加锁 多个线程可以并行执行这个方法 只在同时访问某个成员变量时才需要排队等待
+protected void startInternal() throws LifecycleException {
+
+    setState(LifecycleState.STARTING);
+
+    // 锁engine成员变量
+    if (engine != null) {
+        synchronized (engine) {
+            engine.start();
+        }
+    }
+
+   //锁executors成员变量
+    synchronized (executors) {
+        for (Executor executor: executors) {
+            executor.start();
+        }
+    }
+
+    mapperListener.start();
+
+    //锁connectors成员变量
+    synchronized (connectorsLock) {
+        for (Connector connector: connectors) {
+            // If it has already failed, don't try and start it
+            if (connector.getState() != LifecycleState.FAILED) {
+                connector.start();
+            }
+        }
+    }
+}
+```
+
+**缩小**
+
+
+
+**用原子变量和CAS取代锁**
+
+```java
+
+private boolean startThreads(int threadsToStart)
+{
+    while (threadsToStart > 0 && isRunning())
+    {
+        //获取当前已经启动的线程数，如果已经够了就不需要启动了
+        int threads = _threadsStarted.get();
+        if (threads >= _maxThreads)
+            return false;
+
+        //用CAS方法将线程数加一，请注意执行失败走continue，继续尝试
+        if (!_threadsStarted.compareAndSet(threads, threads + 1))
+            continue;
+
+        boolean started = false;
+        try
+        {
+            Thread thread = newThread(_runnable);
+            thread.setDaemon(isDaemon());
+            thread.setPriority(getThreadsPriority());
+            thread.setName(_name + "-" + thread.getId());
+            _threads.add(thread);//_threads并发集合
+            _lastShrink.set(System.nanoTime());//_lastShrink是原子变量
+            thread.start();
+            started = true;
+            --threadsToStart;
+        }
+        finally
+        {
+            //如果最终线程启动失败，还需要把线程数减一
+            if (!started)
+                _threadsStarted.decrementAndGet();
+        }
+    }
+    return true;
+}
+```
+
+
+
+**并发容器的使用**
+
+```java
+
+public abstract class LifecycleBase implements Lifecycle {
+
+    //事件监听器集合 适用于读多写少的多线程访问场景
+    private final List<LifecycleListener> lifecycleListeners = new CopyOnWriteArrayList<>();
+    
+    ...
+}
+```
+
+
+
+**volatile关键字的使用**
+
+```java
+
+public abstract class LifecycleBase implements Lifecycle {
+
+    //当前组件的生命状态，用volatile修饰
+    private volatile LifecycleState state = LifecycleState.NEW;
+
+}
+```
+
+
+
+
+
+### 内核如何阻塞与唤醒线程
+
+
+
+**进程与线程**：
+
+进程在内核中会对应一个`task_struct`的数据结构，其内容有
+
+- `vm_struct`：保存了进程的各内存区域的起始和终止地址
+
+- 进程号
+
+- 打开的文件
+
+- 创建的socket
+
+- CPU运行上下文
+
+  
+
+线程：
+
+有自己的`task_struct`和运行栈区，但是其他资源如虚拟地址空间，打开的文件，Socket都是跟父进程共用
+
+
+
+
+
+
+
+**进程的虚拟地址空间**：
+
+32位的机器中，给每个进程都分配了4GB（2^32）的虚拟内存地址空间
+
+缺页中断：进程访问到了某个虚拟地址，如果这个地址没有对应的物理内存页，就会产生缺页中断，分配物理内存，MMU（内存管理单元）会维护这个虚拟地址与物理内存页的映射关系
+
+
+
+**分布**：
+
+- 低位的3GB属于用户空间 
+- 高位的1GB属于内核空间 
+
+
+
+**组成**：由高到低
+
+- 内核空间
+
+- 环境变量
+
+- 栈（向低地址扩大）
+
+- 共享库和mmap映射区
+
+  mmap：是一个内存映射函数，可以将文件内容映射到这个内存区域，用户通过读写这段内存，就可以实现对文件的修改，无需通过系统调用read/write，省去了内核空间与用户空间之间的数据拷贝
+
+  Java实现: `MappedByteBuffer`
+
+- 堆（向高地址扩大）
+
+- 数据区
+
+- 代码区
+
+
+
+![](https://static001.geekbang.org/resource/image/d7/86/d78cd0faf850c4efdbe00c63659e0f86.png)
+
+
+
+**不同程序的权限不同**：
+
+- 用户程序只能访问用户空间 访问硬件资源需要通过系统调用（内核中的函数）
+- 内核程序可以访问整个进程空间 可以直接访问各种硬件资源：网卡 磁盘
+
+
+
+
+
+**线程的阻塞与唤醒**
+
+内核将线程当做一个进程进行CPU调度，内核中维护了两个队列一个是可运行的`task_struct`队列，一个是阻塞的`task_struct`队列（本质上就是一个双向链表）
+
+`task_struct`排队使用CPU时间片，使用完之后重新调用CPU，即从队列中再选出一个`task_struct`，恢复期上下文到CPU的寄存器中，然后执行上下文中指定的下一条指令
+
+
+
+阻塞：将`task_struct`移除运行队列，加入到等待队列，重置进程的状态，重新触发一次CPU调度（选择下一个线程）
+
+
+
+唤醒：线程在加入到等待队列的时候，向内核注册了一个回调函数，告诉内核他在等待这个socket的数据，当网卡收到数据，产生硬件中断，内核再通过回调函数唤醒线程，即将线程从等待队列移动到运行队列，同时把数据从内核空间拷贝到用户空间的堆上
+
+
+
+
+
+## 容器
+
+
+
+### Host容器 Tomcat如何实现热加载和热部署
+
+热加载：启动一个后台线程，定期监测类文件的变化，如果有变化就重新加载类
+
+热部署：后台线程定期监测web应用的变化，如果有变化就重新加载整个应用
+
+
+
+**Tomcat的后台线程**
+
+```java
+
+bgFuture = exec.scheduleWithFixedDelay(
+              new ContainerBackgroundProcessor(),//要执行的Runnable
+              backgroundProcessorDelay, //第一次执行延迟多久
+              backgroundProcessorDelay, //之后每次执行间隔多久
+              TimeUnit.SECONDS);        //时间单位
+```
+
+
+
+```java
+// 该类为ContainerBase的内部类
+protected class ContainerBackgroundProcessor implements Runnable {
+
+    @Override
+    public void run() {
+        //请注意这里传入的参数是"宿主类"的实例
+        processChildren(ContainerBase.this);
+    }
+
+    protected void processChildren(Container container) {
+        try {
+            //1. 调用当前容器的backgroundProcess方法。
+            container.backgroundProcess();
+            
+            //2. 遍历所有的子容器，递归调用processChildren，
+            //这样当前容器的子孙都会被处理            
+            Container[] children = container.findChildren();
+            for (int i = 0; i < children.length; i++) {
+            //这里请你注意，容器基类有个变量叫做backgroundProcessorDelay，如果大于0，表明子容器有自己的后台线程，无需父容器来调用它的processChildren方法。
+                if (children[i].getBackgroundProcessorDelay() <= 0) {
+                    processChildren(children[i]);
+                }
+            }
+        } catch (Throwable t) { ... }
+```
+
+这样的设计（组合模式），只有在顶层容器，如engine，启动一个后台线程定期检查变化，那么所有的子容器的定时检查的方法都能触发
+
+
+
+需要定时执行的逻辑放在`backgroundProcess()`方法中
+
+```java
+// ContainerBase的实现
+public void backgroundProcess() {
+
+    //1.执行容器中Cluster组件的周期性任务
+    Cluster cluster = getClusterInternal();
+    if (cluster != null) {
+        cluster.backgroundProcess();
+    }
+    
+    //2.执行容器中Realm组件的周期性任务
+    Realm realm = getRealmInternal();
+    if (realm != null) {
+        realm.backgroundProcess();
+   }
+   
+   //3.执行容器中Valve组件的周期性任务
+    Valve current = pipeline.getFirst();
+    while (current != null) {
+       current.backgroundProcess();
+       current = current.getNext();
+    }
+    
+    //4. 触发容器的"周期事件"，Host容器的监听器HostConfig就靠它来调用
+    fireLifecycleEvent(Lifecycle.PERIODIC_EVENT, null);
+}
+```
+
+
+
+**Tomcat热加载**
+
+就是在StandardContext里面的backgroudProcess()方法里实现的
+
+在`context.xml`文件中设置来开启
+
+```xml
+<Context reloadable="true"/>
+```
+
+
+
+```java
+
+public void backgroundProcess() {
+
+    //WebappLoader周期性的检查WEB-INF/classes和WEB-INF/lib目录下的类文件
+    Loader loader = getLoader();
+    if (loader != null) {
+      	// 里面会调用context的stop和start方法 每个Context都对应一个类加载器
+      	// 会创建一个新的类加载器加载文件
+        loader.backgroundProcess();        
+    }
+    
+    //Session管理器周期性的检查是否有过期的Session
+    Manager manager = getManager();
+    if (manager != null) {
+        manager.backgroundProcess();
+    }
+    
+    //周期性的检查静态资源是否有变化
+    WebResourceRoot resources = getResources();
+    if (resources != null) {
+        resources.backgroundProcess();
+    }
+    
+    //调用父类ContainerBase的backgroundProcess方法
+    super.backgroundProcess();
+}
+```
+
+
+
+
+
+**Tomcat热部署**
+
+部署：销毁掉整个Context对象及其关联的所有资源
+
+实现：通过一个事件监听器`public class HostConfig implements LifecycleListener`
+
+其中的
+
+```java
+
+public void lifecycleEvent(LifecycleEvent event) {
+    // 执行check方法。
+    if (event.getType().equals(Lifecycle.PERIODIC_EVENT)) {
+        check();
+    } 
+}
+
+
+// 检查webapps目录下的所有web目录 如果多了目录就部署响应的web应用 少了目录就将相应的Context容器销毁掉
+protected void check() {
+
+    if (host.getAutoDeploy()) {
+        // 检查这个Host下所有已经部署的Web应用
+        DeployedApplication[] apps =
+            deployed.values().toArray(new DeployedApplication[0]);
+            
+        for (int i = 0; i < apps.length; i++) {
+            //检查Web应用目录是否有变化
+            checkResources(apps[i], false);
+        }
+
+        //执行部署
+        deployApps();
+    }
+}
+```
+
+
+
+
+
+### Context容器（上）:Tomcat如何打破双亲委托机制
+
+
+
+**JVM的类加载器**
+
+- 过程：
+  1. 把`.class`文件加载到JVM的方法区（findClass）
+  2. 在JVM的堆区创建一个`java.lang.Class`对象的实例(defineClass)，用来封装Java类相关的数据和方法
+
+- 主体：类加载器
+
+- 加载时机：只有在运行中用到了这个类才去加载
+
+
+
+```java
+
+public abstract class ClassLoader {
+
+    //每个类加载器都有个父加载器 for delegation
+    private final ClassLoader parent;
+    
+    public Class<?> loadClass(String name) {
+  
+        //查找一下这个类是不是已经加载过了
+        Class<?> c = findLoadedClass(name);
+        
+        //如果没有加载过
+        if( c == null ){
+          //先委托给父加载器去加载，注意这是个递归调用
+          if (parent != null) {
+              c = parent.loadClass(name);
+          }else {
+              // 如果父加载器为空，查找Bootstrap加载器是不是加载过了
+              c = findBootstrapClassOrNull(name);
+          }
+        }
+        // 如果父加载器没加载成功，调用自己的findClass去加载
+        if (c == null) {
+            c = findClass(name);
+        }
+        
+        return c；
+    }
+    
+    protected Class<?> findClass(String name){
+       //1. 根据传入的类名name，到在特定目录下去寻找类文件，把.class文件读入内存
+          ...
+          
+       //2. 调用defineClass将字节数组转成Class对象
+       return defineClass(buf, off, len)；
+    }
+    
+    // 将字节码数组解析成一个Class对象(堆中)，用native方法实现
+    protected final Class<?> defineClass(byte[] b, int off, int len){
+       ...
+    }
+}
+```
+
+
+
+![](https://static001.geekbang.org/resource/image/43/90/43ebbd8e7d24467d2182969fb0496d90.png)
+
+类加载器的层级（工作原理相同 只是加载路径不同 父子关系通过组合 + 委托来实现）
+
+- 启动类加载器：用来加载JVM启动时所需的核心类 /jre/lib
+- 扩展类加载器：加载 /jre/lib/ext
+- 应用程序类加载器：用来加载classpath下的类 `Class.forName()`就是用这个类加载器进行加载
+- 自定义类加载器：用来加载自定义路径下的类（重写`findClass`方法即可）
+
+
+
+**Tomcat的类加载器**
+
+Servlet规范建议：
+
+> Web应用中的全路径类名与应用程序类（Tomcat的JVM的classpath下的类）同名，优先加载Web应用自己定义的类
+
+首先尝试自己去加载某个类（在试着交给扩展类加载器加载之后），找不到再交给应用程序类加载器
+
+实现：重写`findClass`和`loadClass`方法
+
+
+
+
+
+**findClass方法**
+
+```java
+
+public Class<?> findClass(String name) throws ClassNotFoundException {
+    ...
+    
+    Class<?> clazz = null;
+    try {
+            //1. 先在Web应用目录下查找类 
+            clazz = findClassInternal(name);
+    }  catch (RuntimeException e) {
+           throw e;
+       }
+    
+    if (clazz == null) {
+    try {
+            //2. 如果在本地目录没有找到，交给父加载器去查找
+            clazz = super.findClass(name);
+    }  catch (RuntimeException e) {
+           throw e;
+       }
+    
+    //3. 如果父类也没找到，抛出ClassNotFoundException
+    if (clazz == null) {
+        throw new ClassNotFoundException(name);
+     }
+
+    return clazz;
+}
+```
+
+
+
+**loadClass方法**
+
+```java
+
+public Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
+
+    synchronized (getClassLoadingLock(name)) {
+ 
+        Class<?> clazz = null;
+
+        //1. 先在本地cache查找该类是否已经加载过 就是一个CurrentHashMap
+        clazz = findLoadedClass0(name);
+        if (clazz != null) {
+            if (resolve)
+                resolveClass(clazz);
+            return clazz;
+        }
+
+        //2. 从系统类加载器的cache中查找是否加载过
+        clazz = findLoadedClass(name);
+        if (clazz != null) {
+            if (resolve)
+                resolveClass(clazz);
+            return clazz;
+        }
+
+        // 3. 尝试用ExtClassLoader类加载器类加载，为什么？
+      	// 为了不让自己的类跟JRE中类发生冲突（全类名一致的）
+        ClassLoader javaseLoader = getJavaseClassLoader();
+        try {
+            clazz = javaseLoader.loadClass(name);
+            if (clazz != null) {
+                if (resolve)
+                    resolveClass(clazz);
+                return clazz;
+            }
+        } catch (ClassNotFoundException e) {
+            // Ignore
+        }
+
+        // 4. 尝试在本地目录搜索class并加载
+        try {
+            clazz = findClass(name);
+            if (clazz != null) {
+                if (resolve)
+                    resolveClass(clazz);
+                return clazz;
+            }
+        } catch (ClassNotFoundException e) {
+            // Ignore
+        }
+
+        // 5. 尝试用系统类加载器(也就是AppClassLoader)来加载
+            try {
+                clazz = Class.forName(name, false, parent);
+                if (clazz != null) {
+                    if (resolve)
+                        resolveClass(clazz);
+                    return clazz;
+                }
+            } catch (ClassNotFoundException e) {
+                // Ignore
+            }
+       }
+    
+    //6. 上述过程都加载失败，抛出异常
+    throw new ClassNotFoundException(name);
+}
+```
+
+
+
+### Context容器（中） Tomcat如何隔离Web应用的类
+
+
+
+**Tomcat的类加载器需要考虑的问题**：
+
+- 需要隔离不同Web应用加载的类 
+
+  （不同Web应用需要可以加载同名的类）
+
+- 多个Web应用之间需要共享类
+
+- 需要隔离Tomcat自身的类和Web应用的类
+
+
+
+**Tomcat的类加载器的层次**
+
+![](https://static001.geekbang.org/resource/image/62/23/6260716096c77cb89a375e4ac3572923.png)
+
+
+
+如何隔离不同Web应用的类：
+
+每个Context容器维护一个WebAppClassLoader的实例，不同加载器实例加载的类被认为是不同的类
+
+
+
+Web应用之间如何共享类：
+
+不同的WebAppClassLoader的parent都设置为一个`SharedClassLoader`，当自己没有加载到该类时，就会委托父加载器
+
+共享类放在父加载器的加载路径下即可
+
+
+
+如何隔离Tomcat自身的类和Web应用的类：
+
+用`CatalinaClassLoader`专门加载Tomcat自身的类，给`CatalinaClassLoader`和`SharedClassLoader` 加一个父加载器`CommonClassLoader`
+
+需要共享的类放在`CommonClassLoader`的加载路径下
+
+
+
+**Spring的加载问题**
+
+Spring是调用`Class.forName`来加载业务类的，但是它的实现是会用Spring的加载器来加载业务类
+
+Spring由多个Web应用共享 自身的加载器是`SharedClassLoader` 但是它的加载路径下没有业务类
+
+需要拿到业务类对应WebAppClassLoader实例
+
+```java
+public static Class<?> forName(String className) {
+    Class<?> caller = Reflection.getCallerClass();
+    return forName0(className, true, ClassLoader.getClassLoader(caller), caller);
+}
+```
+
+
+
+解决方法：
+
+Tomcat给启动Web应用的线程里面设置了线程上下文加载器（把WebappClassLoader类加载器的实例放到线程私有数据中） 
+
+```java
+originalClassLoader = Thread.currentThread().getContextClassLoader();
+Thread.currentThread().setContextClassLoader(webApplicationClassLoader);
+
+// 中间就是Spring的初始化过程
+
+// 启动方法结束后恢复上下文加载器
+Thread.currentThread().setContextClassLoader(originalClassLoader);
+```
+
+Spring启动的时候从线程私有数据中取出来
+
+```java
+cl = Thread.currentThread().getContextClassLoader();
+```
+
+
+
+
+
+### Context容器（下） Tomcat如何实现Servlet规范
+
+Servlet容器最重要的任务：实例化并调用Servlet
+
+
+
+**Servlet管理**
+
+Context通过Wrapper来管理Servlet
+
+
+
+实例化：
+
+```java
+// wrapper持有一个servlet对象 和 URL映射 初始化参数等其他元信息
+protected volatile Servlet instance = null;
+
+// 初始化方法 懒加载 在用到servlet的时候 才会初始化servlet 
+public synchronized Servlet loadServlet() throws ServletException {
+    Servlet servlet;
+  
+    //1. 创建一个Servlet实例
+    servlet = (Servlet) instanceManager.newInstance(servletClass);    
+    
+    //2.调用了Servlet的init方法，这是Servlet规范要求的
+    initServlet(servlet);
+    
+    return servlet;
+}
+```
+
+
+
+调用：
+
+请求到来时，会调用到Wrapper的BasicValve（即链表中的最后一个结点`StandardWrapperValve`）
+
+```java
+
+public final void invoke(Request request, Response response) {
+
+    //1.实例化Servlet
+    servlet = wrapper.allocate();
+   
+    //2.给当前请求创建一个Filter链 每一个请求一个FilterChain 
+  	// 因为请求路径可能不同 所以会对应不同的Filter
+    ApplicationFilterChain filterChain =
+        ApplicationFilterFactory.createFilterChain(request, wrapper, servlet);
+
+   //3. 调用这个Filter链，Filter链中的最后一个Filter会调用Servlet
+   filterChain.doFilter(request.getRequest(), response.getResponse());
+
+}
+```
+
+
+
+
+
+```java
+// 
+public final class ApplicationFilterChain implements FilterChain {
+  
+  //Filter链中有Filter数组，这个好理解
+  private ApplicationFilterConfig[] filters = new ApplicationFilterConfig[0];
+    
+  //Filter链中的当前的调用位置
+  private int pos = 0;
+    
+  //总共有多少了Filter
+  private int n = 0;
+
+  //每个Filter链对应一个Servlet，也就是它要调用的Servlet
+  private Servlet servlet = null;
+  
+  public void doFilter(ServletRequest req, ServletResponse res) {
+        internalDoFilter(request,response);
+  }
+   
+  private void internalDoFilter(ServletRequest req,
+                                ServletResponse res){
+
+    // 每个Filter链在内部维护了一个Filter数组
+    if (pos < n) {
+        ApplicationFilterConfig filterConfig = filters[pos++];
+        Filter filter = filterConfig.getFilter();
+
+        filter.doFilter(request, response, this);
+        return;
+    }
+
+    servlet.service(request, response);
+   
+}
+  
+  
+// Filter中会回调FilterChain的doFilter方法
+public void doFilter(ServletRequest request, ServletResponse response,
+        FilterChain chain){
+        
+          ...
+          
+          //调用Filter的方法
+          chain.doFilter(request, response);
+      
+      }  
+```
+
+
+
+**Filter管理**
+
+Filter的作用域是整个Web应用，所以在Context中
+
+```java
+private Map<String, FilterDef> filterDefs = new HashMap<>();
+```
+
+
+
+**LIstener管理**
+
+监听容器内部发生的事件
+
+事件类型：
+
+- 生命状态的变化 Context容器启停 Session创建和销毁
+- 属性的变化 Context容器的某个属性值变了 Session的某个属性值变了
+
+```java
+//监听属性值变化的监听器
+private List<Object> applicationEventListenersList = new CopyOnWriteArrayList<>();
+
+//监听生命事件的监听器
+private Object applicationLifecycleListenersObjects[] = new Object[0];
+```
+
+
+
+```java
+//1.拿到所有的生命周期监听器
+Object instances[] = getApplicationLifecycleListeners();
+
+for (int i = 0; i < instances.length; i++) {
+   //2. 判断Listener的类型是不是ServletContextListener
+   if (!(instances[i] instanceof ServletContextListener))
+      continue;
+
+   //3.触发Listener的方法
+   ServletContextListener lr = (ServletContextListener) instances[i];
+   lr.contextInitialized(event);
+}
+```
+
+
+
+### Tomcat如何支持异步Servlet
+
+问题：
+
+一个请求到来，需要从Tomcat线程池中拿一个线程出来处理请求，在线程中会调用Web应用，应用处理完之后，才会输出响应
+
+如果应用处理的时间比较长（IO密集型），请求并发量大，这是会造成Tomcat线程资源紧张，导致没有更多的线程来处理新的请求
+
+
+
+解决方案：
+
+引入异步Servlet，将原来在Tomcat线程中进行的耗时长的操作放到业务线程中进行，Tomcat线程可以立即被回收到线程池，可以提高系统的吞吐量
+
+
+
+**异步Servlet示例**
+
+```java
+@WebServlet(urlPatterns = {"/async"}, asyncSupported = true)
+public class AsyncServlet extends HttpServlet {
+
+    // Web应用线程池 用来处理异步Servlet
+    ExecutorService executor = Executors.newSingleThreadExecutor();
+
+    @Override
+    protected void service(HttpServletRequest req, HttpServletResponse resp) throws ServletException, IOException {
+        // 获取异步上下文 保存request response信息 request中又存储了processor任务类信息
+        final AsyncContext context = req.startAsync();
+        executor.execute(() -> {
+            try {
+                // 此处进行IO密集型操作
+                context.getResponse().getWriter().println("hello");
+            } catch (Exception e) {
+
+            } finally {
+                // 异步处理完之后 调用异步上下文的complete方法
+                context.complete();
+            }
+        });
+    }
+}
+```
+
+
+
+
+
+**异步Servlet原理**
+
+`req.startAsync()`
+
+- 创建异步上下文对象
+- 告诉CoyoteAdapter 当容器处理完之后 不要立即把响应发给浏览器 不要清空Request对象和Response对象
+
+```java
+public AsyncContext startAsync(ServletRequest request,
+            ServletResponse response) {
+        // 在Request中创建异步上下文
+  			if (asyncContext == null) {
+            asyncContext = new AsyncContextImpl(this);
+        }
+  			// 将request response传入异步上下文
+  			// request用于获取请求相关信息
+  			// response用于发送响应
+        asyncContext.setStarted(getContext(), request, response,
+                request==getRequest() && response==getResponse().getResponse());
+  			// 异步请求超时时间为30s
+        asyncContext.setTimeout(getConnector().getAsyncTimeout());
+
+        return asyncContext;
+    }
+
+// setStarted()
+this.request.getCoyoteRequest().action(ActionCode.ASYNC_START, this);
+
+// 最终会修改AsyncStateMachine 状态机中的状态 并传入异步上下文
+ public synchronized void asyncStart(AsyncContextCallback asyncCtxt) {
+        if (state == AsyncState.DISPATCHED) {
+            updateState(AsyncState.STARTING);
+            this.asyncCtxt = asyncCtxt;
+        } 
+}
+```
+
+
+
+```java
+// CoyoteAdapter
+public void service(org.apache.coyote.Request req, org.apache.coyote.Response res) {
+    
+   //调用容器的service方法处理请求
+    connector.getService().getContainer().getPipeline().
+           getFirst().invoke(request, response);
+   
+   //如果是异步Servlet请求，仅仅设置一个标志，
+   //否则说明是同步Servlet请求，就将响应数据刷到浏览器
+    if (request.isAsync()) {
+        async = true;
+    } else {
+        request.finishRequest();
+        response.finishResponse();
+    }
+   
+   //如果不是异步Servlet请求，就清空Request对象和Response对象
+    if (!async) {
+        request.recycle();
+        response.recycle();
+    }
+}
+```
+
+
+
+`asyncContext.complete()`
+
+```java
+public void complete() {   
+    //调用Request对象的action方法，其实就是通知连接器，这个异步请求处理完了
+request.getCoyoteRequest().action(ActionCode.ASYNC_COMPLETE, null);
+    
+}
+
+
+
+case ASYNC_COMPLETE: {
+    clearDispatches();
+    if (asyncStateMachine.asyncComplete()) {
+        processSocketEvent(SocketEvent.OPEN_READ, true);
+    }
+    break;
+}
+
+
+protected void processSocketEvent(SocketEvent event, boolean dispatch) {
+    // 从Request中的ActionHook对象就是Processor对象 里面有Socket对象
+  	SocketWrapperBase<?> socketWrapper = getSocketWrapper();
+    if (socketWrapper != null) {
+        socketWrapper.processSocket(event, dispatch);
+    }
+}
+
+
+
+public boolean processSocket(SocketWrapperBase<S> socketWrapper,
+        SocketEvent event, boolean dispatch) {
+        
+      if (socketWrapper == null) {
+          return false;
+      }
+      // 在sc中的run方法中执行response的写出和 监听新的IO事件
+      SocketProcessorBase<S> sc = processorCache.pop();
+      if (sc == null) {
+          sc = createSocketProcessor(socketWrapper, event);
+      } else {
+          sc.reset(socketWrapper, event);
+      }
+      //线程池运行
+      Executor executor = getExecutor();
+      if (dispatch && executor != null) {
+          executor.execute(sc);
+      } else {
+          sc.run();
+      }
+}
+```
+
+
+
+设计思想：将不同的业务处理所使用的资源隔离开
+
+
+
+### Spring Boot如何使用内嵌式的Tomcat和Jetty
+
+
+
+**Spring Boot中与Web容器相关的接口**
+
+```java
+// 对Tomcat jetty netty 服务器的接口
+public interface WebServer {
+    void start() throws WebServerException;
+    void stop() throws WebServerException;
+    int getPort();
+}
+```
+
+
+
+```java
+
+public interface ServletWebServerFactory {
+    WebServer getWebServer(ServletContextInitializer... initializers);
+}
+
+
+// getWebServer方法会调用初始化器的onStartup方法 在Servlet容器启动的时候做一些事情
+public interface ServletContextInitializer {
+    void onStartup(ServletContext servletContext) throws ServletException;
+}
+```
+
+
+
+**内嵌式Web容器的创建和启动**
+
+```java
+// 通过重写ApplicationContext的抽象子类的onRefresh方法
+@Override
+protected void onRefresh() {
+     super.onRefresh();
+     try {
+        //重写onRefresh方法，调用createWebServer创建和启动Tomcat
+        createWebServer();
+     }
+     catch (Throwable ex) {
+     }
+}
+
+//createWebServer的具体实现
+private void createWebServer() {
+    //这里WebServer是Spring Boot抽象出来的接口，具体实现类就是不同的Web容器
+    WebServer webServer = this.webServer;
+    ServletContext servletContext = this.getServletContext();
+    
+    //如果Web容器还没创建
+    if (webServer == null && servletContext == null) {
+        //通过Web容器工厂来创建
+        ServletWebServerFactory factory = this.getWebServerFactory();
+        //注意传入了一个"SelfInitializer"
+        this.webServer = factory.getWebServer(new ServletContextInitializer[]{this.getSelfInitializer()});
+        
+    } else if (servletContext != null) {
+        try {
+            this.getSelfInitializer().onStartup(servletContext);
+        } catch (ServletException var4) {
+          ...
+        }
+    }
+
+    this.initPropertySources();
+}
+
+
+// 通过调用Tomcat的API来创建组件
+public WebServer getWebServer(ServletContextInitializer... initializers) {
+    //1.实例化一个Tomcat，可以理解为Server组件。
+    Tomcat tomcat = new Tomcat();
+    
+    //2. 创建一个临时目录
+    File baseDir = this.baseDirectory != null ? this.baseDirectory : this.createTempDir("tomcat");
+    tomcat.setBaseDir(baseDir.getAbsolutePath());
+    
+    //3.初始化各种组件
+    Connector connector = new Connector(this.protocol);
+    tomcat.getService().addConnector(connector);
+    this.customizeConnector(connector);
+    tomcat.setConnector(connector);
+    tomcat.getHost().setAutoDeploy(false);
+    this.configureEngine(tomcat.getEngine());
+    
+    //4. 创建定制版的"Context"组件。
+    this.prepareContext(tomcat.getHost(), initializers);
+    return this.getTomcatWebServer(tomcat);
+}
+```
+
+
+
+**Web容器的定制**
+
+通过特定的Web容器的工厂来进行对特定的容器的配置
+
+```java
+// 如：给Tomcat增加一个Valve 用于在请求头中添加traceId 用于分布式追踪
+class TraceValve extends ValveBase {
+    @Override
+    public void invoke(Request request, Response response) throws IOException, ServletException {
+
+        request.getCoyoteRequest().getMimeHeaders().
+        addValue("traceid").setString("1234xxxxabcd");
+
+        Valve next = getNext();
+        if (null == next) {
+            return;
+        }
+
+        next.invoke(request, response);
+    }
+
+}
+
+// 添加一个定制器
+@Component
+public class MyTomcatCustomizer implements
+        WebServerFactoryCustomizer<TomcatServletWebServerFactory> {
+
+    @Override
+    public void customize(TomcatServletWebServerFactory factory) {
+        factory.setPort(8081);
+        factory.setContextPath("/hello");
+        factory.addEngineValves(new TraceValve() );
+
+    }
+}
+```
+
+
+
+### Jetty如何实现具有上下文信息的责任链
+
+![](https://static001.geekbang.org/resource/image/68/50/68f3668cc7b179b5311d1bb5cb3cf350.jpg)
+
+`scopedHandler` ：所有与Servlet规范相关的Handler都是其子类
+
+**ScopedHandler链式调用的实现**
+
+```java
+
+public class HandlerWrapper extends AbstractHandlerContainer
+{
+   protected Handler _handler;
+   
+   @Override
+    public void handle(String target, 
+                       Request baseRequest, 
+                       HttpServletRequest request, 
+                       HttpServletResponse response) 
+                       throws IOException, ServletException
+    {
+        Handler handler=_handler;
+        if (handler!=null)
+            handler.handle(target,baseRequest, request, response);
+    }
+}
+```
+
+
+
+```java
+// scopedHandler
+
+// 头结点
+protected ScopedHandler _outerScope;
+// 下一个scopedHandler结点
+protected ScopedHandler _nextScope;
+
+// 线程私有数据 因为有的信息需要在函数调用中传递
+// 参数中没有 但是又要用到 所以用线程私有数据
+private static final ThreadLocal<ScopedHandler> __outerScope= new ThreadLocal<ScopedHandler>();
+
+public final void handle(String target, 
+                         Request baseRequest, 
+                         HttpServletRequest request,
+                         HttpServletResponse response) 
+                         throws IOException, ServletException
+{
+    if (isStarted())
+    {
+      	// 若为头结点则使用doScope方法 进行初始化操作
+        if (_outerScope==null)
+            doScope(target,baseRequest,request, response);
+        else
+            doHandle(target,baseRequest,request, response);
+    }
+}
+
+
+// 设置_nextScope _outerScope是为了确保先执行完所有的doScope方法 
+// 再执行所有的doHandle方法
+public void doScope(String target, 
+                    Request baseRequest, 
+                    HttpServletRequest request, 
+                    HttpServletResponse response)
+       throws IOException, ServletException
+{
+    nextScope(target,baseRequest,request,response);
+}
+
+public final void nextScope(String target, 
+                            Request baseRequest, 
+                            HttpServletRequest request,
+                            HttpServletResponse response)
+                            throws IOException, ServletException
+{
+    if (_nextScope!=null)
+        _nextScope.doScope(target,baseRequest,request, response);
+    else if (_outerScope!=null)
+        _outerScope.doHandle(target,baseRequest,request, response);
+    else
+        doHandle(target,baseRequest,request, response);
+}
+
+public abstract void doHandle(String target, 
+                              Request baseRequest, 
+                              HttpServletRequest request,
+                              HttpServletResponse response)
+       throws IOException, ServletException;
+       
+
+public final void nextHandle(String target, 
+                             final Request baseRequest,
+                             HttpServletRequest request,
+                             HttpServletResponse response) 
+       throws IOException, ServletException
+{
+    if (_nextScope!=null && _nextScope==_handler)
+        _nextScope.doHandle(target,baseRequest,request, response);
+    else if (_handler!=null)
+        super.handle(target,baseRequest,request,response);
+}
+```
+
+
+
+```java
+// ScopedHandler启动的时候 会调用该方法 设置_outScope和_nextScope
+@Override
+protected void doStart() throws Exception
+{
+    try
+    {
+        //请注意_outScope是一个实例变量，而__outerScope是一个全局变量。先读取全局的线程私有变量__outerScope到_outerScope中
+ _outerScope=__outerScope.get();
+ 
+        //如果全局的__outerScope还没有被赋值，说明执行doStart方法的是头节点
+        if (_outerScope==null)
+            //handler链的头节点将自己的引用填充到__outerScope
+            __outerScope.set(this);
+
+        //调用父类HandlerWrapper的doStart方法
+        super.doStart();
+        //各Handler将自己的_nextScope指向下一个ScopedHandler
+        _nextScope= getChildHandlerByClass(ScopedHandler.class);
+    }
+    finally
+    {
+      // 回调头结点 将线程私有数据清空 因为线程可能会被重用
+        if (_outerScope==null)
+            __outerScope.set(null);
+    }
+}
+```
+
+
+
+
+
+### Spring中的设计模式
+
+**简单工厂**：静态工厂方法，根据传入的参数来动态决定创建哪个产品类(反射创建Bean)
+
+```java
+public interface BeanFactory {
+   Object getBean(String name) throws BeansException;
+   <T> T getBean(String name, Class<T> requiredType);
+   Object getBean(String name, Object... args);
+   <T> T getBean(Class<T> requiredType);
+   <T> T getBean(Class<T> requiredType, Object... args);
+   boolean containsBean(String name);
+   boolean isSingleton(String name);
+   boolea isPrototype(String name);
+   boolean isTypeMatch(String name, ResolvableType typeToMatch);
+   boolean isTypeMatch(String name, Class<?> typeToMatch);
+   Class<?> getType(String name);
+   String[] getAliases(String name);
+}
+```
+
+
+
+**工厂方法模式**：一个工厂只对应一个相应的对象
+
+```java
+
+public interface FactoryBean<T> {
+  T getObject()；
+  Class<?> getObjectType();
+  boolean isSingleton();
+}
+```
+
+
+
+**单例模式**：单例注册表
+
+```java
+
+public class DefaultSingletonBeanRegistry {
+    
+    //使用了线程安全容器ConcurrentHashMap，保存各种单实例对象
+    private final Map<String, Object> singletonObjects = new ConcurrentHashMap<String, Object>;
+
+    protected Object getSingleton(String beanName) {
+    //先到HashMap中拿Object
+    Object singletonObject = singletonObjects.get(beanName);
+    
+    //如果没拿到通过反射创建一个对象实例，并添加到HashMap中
+    if (singletonObject == null) {
+      singletonObjects.put(beanName,
+                           Class.forName(beanName).newInstance());
+   }
+   
+   //返回对象实例
+   return singletonObjects.get(beanName);
+  }
+}
+```
+
+
+
+**代理模式**：动态代理
+
+
+
+
+
+### Manager组件：Tomcat的Session管理机制解析
+
+
+
+**Session的创建**
+
+Context容器中通过Manager管理Session
+
+`protected Map<String, Session> sessions = new ConcurrentHashMap<>();`
+
+```java
+// 添加和删除Session load unload来序列化和反序列化Session(持久化)
+public interface Manager {
+    public Context getContext();
+    public void setContext(Context context);
+    public SessionIdGenerator getSessionIdGenerator();
+    public void setSessionIdGenerator(SessionIdGenerator sessionIdGenerator);
+    public long getSessionCounter();
+    public void setSessionCounter(long sessionCounter);
+    public int getMaxActive();
+    public void setMaxActive(int maxActive);
+    public int getActiveSessions();
+    public long getExpiredSessions();
+    public void setExpiredSessions(long expiredSessions);
+    public int getRejectedSessions();
+    public int getSessionMaxAliveTime();
+    public void setSessionMaxAliveTime(int sessionMaxAliveTime);
+    public int getSessionAverageAliveTime();
+    public int getSessionCreateRate();
+    public int getSessionExpireRate();
+    public void add(Session session);
+    public void changeSessionId(Session session);
+    public void changeSessionId(Session session, String newId);
+    public Session createEmptySession();
+    public Session createSession(String sessionId);
+    public Session findSession(String id) throws IOException;
+    public Session[] findSessions();
+    public void load() throws ClassNotFoundException, IOException;
+    public void remove(Session session);
+    public void remove(Session session, boolean update);
+    public void addPropertyChangeListener(PropertyChangeListener listener)
+    public void removePropertyChangeListener(PropertyChangeListener listener);
+    public void unload() throws IOException;
+    public void backgroundProcess();
+    public boolean willAttributeDistribute(String name, Object value);
+}
+```
+
+
+
+`request.getSession()`
+
+> 如果Cookie中有JSESSIONID 则通过这个ID获取session对象 否则就创建一个新的
+
+
+
+```java
+public class Request implements HttpServletRequest {}
+
+// 实际上获取的是一个包装类 用于避免细节暴露给使用者 装饰者模式
+public class RequestFacade implements HttpServletRequest {
+  protected Request request = null;
+  
+  public HttpSession getSession(boolean create) {
+     return request.getSession(create);
+  }
+}
+```
+
+
+
+`getSession()`
+
+```java
+// request类
+public HttpSession getSession(boolean create) {
+        Session session = doGetSession(create);
+        if (session == null) {
+            return null;
+        }
+ 				// 这个方法中创建了request的包装类 并返回包装类
+        return session.getSession();
+}
+
+// request 
+protected Session doGetSession(boolean create) {
+        // There cannot be a session if no context has been assigned yet
+        Context context = getContext();
+        if (context == null) {
+            return null;
+        }
+        // Return the current session if it exists and is valid
+        if ((session != null) && !session.isValid()) {
+            session = null;
+        }
+  			// request自身持有的Session一级缓存 如果该request之前调用过这个方法 就会有
+        if (session != null) {
+            return session;
+        }
+        // Return the requested session if it exists and is valid
+        Manager manager = context.getManager();
+        if (manager == null) {
+            return null;      // Sessions are not supported
+        }
+        if (requestedSessionId != null) {
+          	// 根据sessionId到map中找 map可以看作是二级缓存 
+             session = manager.findSession(requestedSessionId);
+            if ((session != null) && !session.isValid()) {
+                session = null;
+            }
+            if (session != null) {
+              	// 刷新访问时间
+                session.access();
+                return session;
+            }
+        }
+  			// map中没有找到 通过manager创建
+  			session = manager.createSession(sessionId);
+        // Creating a new session cookie based on that session
+        if (session != null && trackModesIncludesCookie) {
+            Cookie cookie = ApplicationSessionCookieConfig.createSessionCookie(
+                    context, session.getIdInternal(), isSecure());
+            response.addSessionCookieInternal(cookie);
+        }
+        if (session == null) {
+            return null;
+        }
+        session.access();
+        return session;
+}
+
+
+// ManagerBase
+@Override
+public Session createSession(String sessionId) {
+    //首先判断Session数量是不是到了最大值，最大Session数可以通过参数设置
+    if ((maxActiveSessions >= 0) &&
+            (getActiveSessions() >= maxActiveSessions)) {
+        rejectedSessions++;
+        throw new TooManyActiveSessionsException(
+                sm.getString("managerBase.createSession.ise"),
+                maxActiveSessions);
+    }
+
+    // 重用或者创建一个新的Session对象，请注意在Tomcat中就是StandardSession
+    // 它是HttpSession的具体实现类，而HttpSession是Servlet规范中定义的接口
+    Session session = createEmptySession();
+
+
+    // 初始化新Session的值
+    session.setNew(true);
+    session.setValid(true);
+    session.setCreationTime(System.currentTimeMillis());
+    session.setMaxInactiveInterval(getContext().getSessionTimeout() * 60);
+    String id = sessionId;
+    if (id == null) {
+        id = generateSessionId();
+    }
+  // 这里会将Session添加到ConcurrentHashMap中 同时通知监听器
+    session.setId(id);
+    sessionCounter++;
+    //将创建时间添加到LinkedList中，并且把最先添加的时间移除
+    //主要还是方便清理过期Session
+    SessionTiming timing = new SessionTiming(session.getCreationTime(), 0);
+    synchronized (sessionCreationTiming) {
+        sessionCreationTiming.add(timing);
+        sessionCreationTiming.poll();
+    }
+    return session
+}
+
+// StandardSession
+public void setId(String id, boolean notify) {
+				// 创建session的时候传入了一个Manager
+        if ((this.id != null) && (manager != null))
+            manager.remove(this);
+        this.id = id;
+        if (manager != null)
+            manager.add(this);
+        if (notify) {
+          // 通知监听器 session创建事件发生
+            tellNew();
+        }
+    }
+
+
+public class StandardSession implements HttpSession, Session, Serializable {
+    protected ConcurrentMap<String, Object> attributes = new ConcurrentHashMap<>();
+    protected long creationTime = 0L;
+    protected transient volatile boolean expiring = false;
+  	// 对外暴露的是包装类
+    protected transient StandardSessionFacade facade = null;
+    protected String id = null;
+    protected volatile long lastAccessedTime = creationTime;
+    protected transient ArrayList<SessionListener> listeners = new ArrayList<>();
+    protected transient Manager manager = null;
+    protected volatile int maxInactiveInterval = -1;
+    protected volatile boolean isNew = false;
+    protected volatile boolean isValid = false;
+    protected transient Map<String, Object> notes = new Hashtable<>();
+    protected transient Principal principal = null;
+}
+```
+
+
+
+
+
+**Session的清理**
+
+Tomcat的定时任务线程`ContainerBackgroundProcessor`会调用容器自身的`backgroundProcess`方法和子容器的后台处理方法
+
+![](https://static001.geekbang.org/resource/image/3b/eb/3b2dfa635469c0fe7e3a17e2517c53eb.jpg)
+
+
+
+StandardContext中的backgroudProcess会调用Manager的backgroudProcess方法
+
+```java
+// StandardManager
+public void backgroundProcess() {
+    // processExpiresFrequency 默认值为6，而backgroundProcess默认每隔10s调用一次，也就是说除了任务执行的耗时，每隔 60s 执行一次
+    count = (count + 1) % processExpiresFrequency;
+    if (count == 0) // 默认每隔 60s 执行一次 Session 清理
+        processExpires();
+}
+
+/**
+ * 单线程处理，不存在线程安全问题
+ */
+public void processExpires() {
+    // 获取所有的 Session
+    Session sessions[] = findSessions();   
+    int expireHere = 0 ;
+    for (int i = 0; i < sessions.length; i++) {
+        // Session 的过期是在isValid()方法里处理的
+        if (sessions[i]!=null && !sessions[i].isValid()) {
+            expireHere++;
+        }
+    }
+}
+```
+
+
+
+**Session事件通知**
+
+```java
+
+public interface HttpSessionListener extends EventListener {
+    //Session创建时调用
+    public default void sessionCreated(HttpSessionEvent se) {
+    }
+    
+    //Session销毁时调用
+    public default void sessionDestroyed(HttpSessionEvent se) {
+    }
+}
+
+
+public void tellNew() {
+
+    // 通知org.apache.catalina.SessionListener
+    fireSessionEvent(Session.SESSION_CREATED_EVENT, null);
+
+    // 获取Context内部的LifecycleListener并判断是否为HttpSessionListener
+    Context context = manager.getContext();
+    Object listeners[] = context.getApplicationLifecycleListeners();
+    if (listeners != null && listeners.length > 0) {
+    
+        //创建HttpSessionEvent
+        HttpSessionEvent event = new HttpSessionEvent(getSession());
+        for (int i = 0; i < listeners.length; i++) {
+            //判断是否是HttpSessionListener
+            if (!(listeners[i] instanceof HttpSessionListener))
+                continue;
+                
+            HttpSessionListener listener = (HttpSessionListener) listeners[i];
+            //注意这是容器内部事件
+            context.fireContainerEvent("beforeSessionCreated", listener);   
+            //触发Session Created 事件
+            listener.sessionCreated(event);
+            
+            //注意这也是容器内部事件
+            context.fireContainerEvent("afterSessionCreated", listener);
+            
+        }
+    }
+}
+```
+
+
+
+```
+java -Xmx32m -Xss400k -verbose:gc -Xloggc:/Users/yangsiping/programme/Java/designpattern/gc.log -XX:+PrintGCTimeStamps -XX:+PrintGCDateStamps -XX:+PrintGCDetails -XX:+UseGCLogFileRotation -XX:NumberOfGCLogFiles=10 -XX:GCLogFileSize=1024k -jar
+```
 

@@ -2,6 +2,48 @@
 
 ## 2021
 
+## **阶段一：（7天）**
+
+**热量≈846kcal/天，成本≈45/天，体重下降6-8斤**
+
+**早餐：**小轻砖*2（170kcal）+伊利舒化奶*1（142kcal）
+
+**中餐：**小轻砖*2（170kcal）+核桃*3颗（126kcal）*1+小份水果（80kcal）
+
+**晚餐：**小轻砖*1（85kcal）+鸡蛋*1（73kcal）
+
+
+
+## **阶段二：限能量平衡膳食CRD（21天）**
+
+**热量≈1228kcal，成本≈60/天，体重下降12-15斤**
+
+**早餐：**小轻砖*2（170kcal）+鸡蛋*1（73kcal）+伊利舒化奶*1（142kcal）
+
+**中餐：**小轻砖*2 （170kcal）+香蕉*1（115kcal）+酸奶*1（141kcal）+鸡胸肉40g（54kcal）
+
+**晚餐：**全麦吐司*1（109kcal）+卤牛肉75g（225kcal）+黄瓜1根（29kcal）
+
+**注：此阶段请开始有氧运动，**建议大家从跑步开始尝试，我是从2km开始的，到后面每天都可以跑5-7km。
+
+
+
+## **阶段三：维稳（3个月）**
+
+**热量≈1600kcal/天，成本≈53/天，体重下降8-10斤**
+
+**早餐：**小轻砖*2（170kcal）+鸡蛋*1（73kcal）+伊利舒化奶*1（142kcal）
+
+**中餐：**少油少盐多蔬菜的食堂餐（1000kcal以内）
+
+**晚餐：**小轻砖2（170kcal）+黄瓜*1（29kcal）
+
+
+
+
+
+
+
 ### 5.10-5.16
 
 - [x] Leetcode 7
@@ -250,7 +292,18 @@ Problem Set:
 
 - [ ] [WebSocket](https://www.tutorialspoint.com/websockets/index.htm)
 
+- [ ] `unix select poll epoll`
+- [ ] [Java classpath](https://stackoverflow.com/questions/2396493/what-is-a-classpath-and-how-do-i-set-it)
 
 
 
+
+
+
+
+- [ ] kafka入门
+- [ ] pulsar入门
+- [ ] clickhouse入门
+- [ ] disruptor使用与原理
+- [ ] evenbus使用与原理
 
