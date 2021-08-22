@@ -53,3 +53,7 @@ cat /proc/cpuinfo | grep 'physical id' | sort | uniq | wc -l
 
 [xshell快捷键](https://www.vckai.com/xshell-kuai-jie-jian-fei-chang-shi-yong)
 
+
+
+[top命令](https://www.cnblogs.com/peida/archive/2012/12/24/2831353.html)
+

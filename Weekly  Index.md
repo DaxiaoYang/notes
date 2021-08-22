@@ -256,15 +256,15 @@ Problem Set:
 
 - `spring`单例的范围是IOC容器
 
--  `memory swapping`
+- `memory swapping`
 
--  再看一下算法专栏hash的用途
+- 再看一下算法专栏hash的用途
 
 - **布隆过滤器: java: BitSet Guava bloomFilter**
 
--  `gitub`的使用
+- `gitub`的使用
 
--  再梳理一下函数调用的过程 汇编
+- 再梳理一下函数调用的过程 汇编
 
 - [`java.nio`](http://tutorials.jenkov.com/java-nio/index.html)
 
@@ -278,21 +278,22 @@ Problem Set:
   >
   > What threads spend their idle time on when not blocked in IO calls, is usually performing IO on other channels in the meantime. That is, a single thread can now manage multiple channels of input and output.
 
--  [tomcat热部署](https://blog.csdn.net/joeyon1985/article/details/46722655)
+- [tomcat热部署](https://blog.csdn.net/joeyon1985/article/details/46722655)
 
 - ==shell脚本编程==
 
 - ==clickhouse==
 
--  servlet规范
+- servlet规范
 
--  [UML类图](https://zhuanlan.zhihu.com/p/109655171)
+- [UML类图](https://zhuanlan.zhihu.com/p/109655171)
 
 - [ ] [Java nio server](https://github.com/jjenkov/java-nio-server)
 
 - [ ] [WebSocket](https://www.tutorialspoint.com/websockets/index.htm)
 
 - [ ] `unix select poll epoll`
+
 - [ ] [Java classpath](https://stackoverflow.com/questions/2396493/what-is-a-classpath-and-how-do-i-set-it)
 
 
@@ -301,9 +302,54 @@ Problem Set:
 
 
 
-- [ ] kafka入门
-- [ ] pulsar入门
+- [x] kafka入门
+- [x] pulsar入门
 - [ ] clickhouse入门
-- [ ] disruptor使用与原理
-- [ ] evenbus使用与原理
+- [ ] AQS源码
+
+
+
+
+
+Msgpack用法 https://github.com/msgpack/msgpack-java/blob/develop/msgpack-jackson/README.md
+
+
+
+### 7.12
+
+- [ ] ThreadLocalRandom()
+- [ ] abelian group
+- [ ] 补码加法出现溢出的情况
+- [ ] `kafka zero copy`
+
+
+
+
+
+推荐CMU在YouTube上的[Intro/Advanced] Database System 
+
+CMU 15-445
+
+
+
+### 8.9-8.15
+
+- [ ] leetcode 7
+- [ ] db4章
+- [ ] clickhouse150 -> 210
+- [ ] distruptor源码 每天半小时
+
+[UUID](https://cloud.tencent.com/developer/article/1530850)
+
+[uuid creator](https://github.com/f4b6a3/uuid-creator)
+
+https://stackoverflow.com/questions/18244897/how-to-generate-time-based-uuids
+
+[MMAP](https://www.cnblogs.com/huxiao-tee/p/4660352.html)
+
+
+
+
+
+
 
